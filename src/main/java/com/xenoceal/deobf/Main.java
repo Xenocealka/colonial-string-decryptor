@@ -10,6 +10,7 @@ import org.objectweb.asm.tree.*;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
@@ -21,15 +22,21 @@ import java.util.Map;
 import java.util.jar.JarEntry;
 import java.util.jar.JarFile;
 import java.util.jar.JarOutputStream;
-import java.util.stream.Stream;
 
 /* Sorry for shit code :c */
 public final class Main
-        implements Opcodes {
+        extends URLClassLoader implements Opcodes {
 
-    private static final Map<String, ClassNode> CLASS_NODE_MAP;
+    private final Map<String, ClassNode> classes;
 
-    public static void main(String[] args)
+    private char[] charArray;
+
+    private Main() {
+        super(new URL[0]);
+        this.classes = new HashMap<>();
+    }
+
+    private void start(String[] args)
             throws IOException {
         val options = new Options();
 
@@ -39,7 +46,7 @@ public final class Main
         val output = new Option("out", "output", true, "output file path");
         output.setRequired(true);
 
-        val libs = new Option("libs", "libraries", true, "path to library directory");
+        val libs = new Option("libs", "libraries", true, "path to libraries");
         libs.setRequired(false);
 
         options.addOption(input);
@@ -58,25 +65,8 @@ public final class Main
             return;
         }
 
-        val libsPath = cmd.getOptionValue("libraries");
-
-        if (libsPath != null) {
-            val file = new File(libsPath);
-            try (Stream<Path> stream = Files.walk(file.toPath())) {
-                stream.forEach(path -> {
-                    try {
-                        addURL(path.toFile().toURI().toURL());
-                    } catch (MalformedURLException e) {
-                        e.printStackTrace();
-                    }
-                });
-            }
-        }
-
         val inputPath = cmd.getOptionValue("input");
         val outputPath = cmd.getOptionValue("output");
-
-        addURL(new File(inputPath).toURI().toURL());
 
         val jarFile = new JarFile(inputPath);
         val entries = jarFile.entries();
@@ -94,50 +84,86 @@ public final class Main
 
             reader.accept(node, ClassReader.SKIP_DEBUG);
 
-            CLASS_NODE_MAP.put(node.name, node);
+            classes.put(node.name, node);
 
             inputStream.close();
         }
 
-        for (val node : CLASS_NODE_MAP.values()) {
+        val libsPath = cmd.getOptionValue("libraries");
+        if (libsPath != null) {
+            try (val stream = Files.walk(Paths.get(libsPath))) {
+                stream.map(Path::toFile).forEach(file -> {
+                    try {
+                        addURL(file.toURI().toURL());
+                    } catch (MalformedURLException e) {
+                        e.printStackTrace();
+                    }
+                });
+            }
+        }
+
+        addURL(new File(inputPath).toURI().toURL());
+
+        for (val node : classes.values()) {
             for (val method : node.methods) {
-                for (val instruction : method.instructions) {
-                    if (instruction.getOpcode() == INVOKEVIRTUAL || instruction.getOpcode() == INVOKESTATIC) {
-                        if (instruction instanceof MethodInsnNode) {
-                            val methodInsnNode = (MethodInsnNode) instruction;
-                            if (methodInsnNode.desc.equals("(IILjava/lang/String;II)Ljava/lang/String;")) {
-                                try {
-                                    val clazz = Class.forName(methodInsnNode.owner.replace('/', '.'), true, ClassLoader.getSystemClassLoader());
-                                    val mtd = clazz.getDeclaredMethod(methodInsnNode.name, int.class, int.class, String.class, int.class, int.class);
+                if (!method.name.equals("<clinit>"))
+                    continue;
 
-                                    val abstractInsnNodes = new AbstractInsnNode[6];
-                                    abstractInsnNodes[0] = methodInsnNode;
+                for (val insn : method.instructions) {
+                    if (insn instanceof FieldInsnNode) {
+                        val fInsn = (FieldInsnNode) insn;
 
-                                    for (var i = 1; i < abstractInsnNodes.length; ++i)
-                                        abstractInsnNodes[i] = abstractInsnNodes[i - 1].getPrevious();
+                        if (!fInsn.desc.equals("[C"))
+                            continue;
 
-                                    val ldc1 = (LdcInsnNode) abstractInsnNodes[5];
-                                    val ldc2 = (LdcInsnNode) abstractInsnNodes[4];
-                                    val ldc3 = (LdcInsnNode) abstractInsnNodes[3];
-                                    val ldc4 = (LdcInsnNode) abstractInsnNodes[2];
-                                    val ldc5 = (LdcInsnNode) abstractInsnNodes[1];
+                        try {
+                            val clazz = Class.forName(node.name.replace('/', '.'), true, this);
+                            val field = getField(clazz, fInsn.name, char[].class);
 
-                                    val decryptString = (String) mtd.invoke(
-                                            null,
-                                            (int) ldc1.cst,
-                                            (int) ldc2.cst,
-                                            (String) ldc3.cst,
-                                            (int) ldc4.cst,
-                                            (int) ldc5.cst
-                                    );
+                            if (field == null)
+                                continue;
 
-                                    method.instructions.insert(abstractInsnNodes[abstractInsnNodes.length -1 ], new LdcInsnNode(decryptString));
+                            charArray = (char[]) field.get(null);
+                        } catch (Exception e) {
+                            e.printStackTrace();
+                        }
 
-                                    for (val abstractInsnNode : abstractInsnNodes)
-                                        method.instructions.remove(abstractInsnNode);
-                                } catch (Exception e) {
-                                    e.printStackTrace();
-                                }
+                        break;
+                    }
+                }
+            }
+
+            for (val method : node.methods) {
+                for (val insn : method.instructions) {
+                    if (insn.getOpcode() == INVOKEVIRTUAL || insn.getOpcode() == INVOKESTATIC) {
+                        if (insn instanceof MethodInsnNode) {
+                            val mInsn = (MethodInsnNode) insn;
+
+                            if (mInsn.desc.equals("(IILjava/lang/String;II)Ljava/lang/String;")) {
+                                val abstractInsnNodes = new AbstractInsnNode[6];
+                                abstractInsnNodes[0] = mInsn;
+
+                                for (var i = 1; i < abstractInsnNodes.length; ++i)
+                                    abstractInsnNodes[i] = abstractInsnNodes[i - 1].getPrevious();
+
+                                val ldc1 = (LdcInsnNode) abstractInsnNodes[5];
+                                val ldc2 = (LdcInsnNode) abstractInsnNodes[4];
+                                val ldc3 = (LdcInsnNode) abstractInsnNodes[3];
+                                val ldc4 = (LdcInsnNode) abstractInsnNodes[2];
+                                val ldc5 = (LdcInsnNode) abstractInsnNodes[1];
+
+                                val decryptString = decrypt(
+                                        (int) ldc1.cst,
+                                        (int) ldc2.cst,
+                                        (String) ldc3.cst,
+                                        (int) ldc4.cst,
+                                        (int) ldc5.cst
+                                );
+
+                                method.instructions.insert(abstractInsnNodes[abstractInsnNodes.length - 1], new LdcInsnNode(decryptString));
+
+                                for (val abstractInsnNode : abstractInsnNodes)
+                                    method.instructions.remove(abstractInsnNode);
                             }
                         }
                     }
@@ -149,7 +175,7 @@ public final class Main
 
         val jos = new JarOutputStream(Files.newOutputStream(Paths.get(outputPath)));
 
-        for (Map.Entry<String, ClassNode> entry : CLASS_NODE_MAP.entrySet()) {
+        for (Map.Entry<String, ClassNode> entry : classes.entrySet()) {
             val node = entry.getValue();
             val writer = new ClassWriter(ClassWriter.COMPUTE_MAXS);
 
@@ -163,18 +189,46 @@ public final class Main
         jos.close();
     }
 
-    private static void addURL(URL url) {
-        try {
-            val addURL = URLClassLoader.class.getDeclaredMethod("addURL", URL.class);
-            addURL.setAccessible(true);
-            addURL.invoke(ClassLoader.getSystemClassLoader(), url);
-        } catch (Exception e) {
-            e.printStackTrace();
+    public static void main(String[] args)
+            throws IOException {
+        try (val main = new Main()) {
+            main.start(args);
         }
     }
 
-    static {
-        CLASS_NODE_MAP = new HashMap<>();
+    private String decrypt(int n, int n2, String str, int n3, int n4) {
+        val builder = new StringBuilder();
+        var n5 = 0;
+        val chars = str.toCharArray();
+        var n6 = chars.length;
+        var n7 = 0;
+        while (n7 < n6) {
+            val c = chars[n7];
+            builder.append((char) (c ^ charArray[n5 % charArray.length] ^ (n ^ xor(n3, n5)) ^ n2 ^ n4));
+            ++n5;
+            ++n7;
+        }
+        return builder.toString();
+    }
+
+    private int xor(int n, int n2) {
+        return ((n | n2) << 1) + ~(n ^ n2) + 1;
+    }
+
+    private Field getField(Class<?> clazz, String name, Class<?> type) {
+        Field field = null;
+
+        for (val f : clazz.getDeclaredFields()) {
+            if (f.getName().equals(name) && f.getType() == type) {
+                field = f;
+                break;
+            }
+        }
+
+        if (field != null)
+            field.setAccessible(true);
+
+        return field;
     }
 
 }
