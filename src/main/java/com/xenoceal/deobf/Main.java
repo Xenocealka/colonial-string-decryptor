@@ -8,15 +8,10 @@ import org.objectweb.asm.ClassWriter;
 import org.objectweb.asm.Opcodes;
 import org.objectweb.asm.tree.*;
 
-import java.io.File;
 import java.io.IOException;
-import java.lang.reflect.Field;
-import java.net.MalformedURLException;
-import java.net.URL;
-import java.net.URLClassLoader;
 import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.jar.JarEntry;
@@ -25,14 +20,13 @@ import java.util.jar.JarOutputStream;
 
 /* Sorry for shit code :c */
 public final class Main
-        extends URLClassLoader implements Opcodes {
+        implements Opcodes {
 
     private final Map<String, ClassNode> classes;
 
     private char[] charArray;
 
     private Main() {
-        super(new URL[0]);
         this.classes = new HashMap<>();
     }
 
@@ -46,12 +40,8 @@ public final class Main
         val output = new Option("out", "output", true, "output file path");
         output.setRequired(true);
 
-        val libs = new Option("libs", "libraries", true, "path to libraries");
-        libs.setRequired(false);
-
         options.addOption(input);
         options.addOption(output);
-        options.addOption(libs);
 
         val parser = new DefaultParser();
         val formatter = new HelpFormatter();
@@ -89,51 +79,96 @@ public final class Main
             inputStream.close();
         }
 
-        val libsPath = cmd.getOptionValue("libraries");
-        if (libsPath != null) {
-            try (val stream = Files.walk(Paths.get(libsPath))) {
-                stream.map(Path::toFile).forEach(file -> {
-                    try {
-                        addURL(file.toURI().toURL());
-                    } catch (MalformedURLException e) {
-                        e.printStackTrace();
-                    }
-                });
-            }
-        }
-
-        addURL(new File(inputPath).toURI().toURL());
-
         for (val node : classes.values()) {
+            if ((node.access & ACC_SYNTHETIC) != 0)
+                node.access &= ~ACC_SYNTHETIC;
+
             for (val method : node.methods) {
                 if (!method.name.equals("<clinit>"))
                     continue;
 
-                for (val insn : method.instructions) {
-                    if (insn instanceof FieldInsnNode) {
-                        val fInsn = (FieldInsnNode) insn;
+                val insnList = new ArrayList<AbstractInsnNode>();
 
-                        if (!fInsn.desc.equals("[C"))
+                for (val insn : method.instructions.toArray()) {
+                    if (insn.getOpcode() == BIPUSH)
+                        insnList.add(insn);
+                }
+
+                insnList.remove(0);
+
+                val chars = new char[insnList.size()];
+
+                for (var i = 0; i < insnList.size(); ++i) {
+                    val intInsn = (IntInsnNode) insnList.get(i);
+                    chars[i] = (char) intInsn.operand;
+                }
+
+                charArray = decrypt((String) ((LdcInsnNode) method.instructions.get(0)).cst, chars);
+
+                insnList.clear();
+
+                var deleted = false;
+                for (val insn : method.instructions.toArray()) {
+                    if (insn instanceof FieldInsnNode) {
+                        if (deleted)
                             continue;
 
-                        try {
-                            val clazz = Class.forName(node.name.replace('/', '.'), true, this);
-                            val field = getField(clazz, fInsn.name, char[].class);
+                        if (insn.getOpcode() != PUTSTATIC)
+                            continue;
 
-                            if (field == null)
+                        val fInsn = (FieldInsnNode) insn;
+
+                        if (fInsn.desc.equals("[C"))
+                            node.fields.removeIf(fieldNode ->
+                                    fieldNode.name.equals(fInsn.name) &&
+                                    fieldNode.desc.equals(fInsn.desc)
+                            );
+
+                        val previous = insn.getPrevious();
+                        if (previous instanceof MethodInsnNode) {
+                            if (previous.getOpcode() != INVOKEVIRTUAL)
                                 continue;
 
-                            charArray = (char[]) field.get(null);
-                        } catch (Exception e) {
-                            e.printStackTrace();
+                            val mInsn = (MethodInsnNode) previous;
+                            if (mInsn.name.equals("toCharArray") && mInsn.desc.equals("()[C")) {
+                                method.instructions.remove(previous);
+                                method.instructions.remove(fInsn);
+                            }
                         }
 
-                        break;
+                        deleted = true;
+                    } else if (insn instanceof MethodInsnNode) {
+                        val mInsn = (MethodInsnNode) insn;
+
+                        if (mInsn.getOpcode() == INVOKEVIRTUAL) {
+                            if (mInsn.name.equals("intern") && mInsn.desc.equals("()Ljava/lang/String;")) {
+                                var next = mInsn.getNext()
+                                        .getNext()
+                                        .getNext()
+                                        .getNext()
+                                        .getNext();
+
+                                val index = method.instructions.indexOf(next);
+
+                                for (var i = index + 1; i < method.instructions.size(); ++i)
+                                    insnList.add(method.instructions.get(i));
+
+                                method.instructions.clear();
+
+                                for (val insnNode : insnList)
+                                    method.instructions.add(insnNode);
+
+                                break;
+                            }
+                        }
                     }
                 }
             }
 
             for (val method : node.methods) {
+                if ((method.access & ACC_SYNTHETIC) != 0)
+                    method.access &= ~ACC_SYNTHETIC;
+
                 for (val insn : method.instructions) {
                     if (insn.getOpcode() == INVOKEVIRTUAL || insn.getOpcode() == INVOKESTATIC) {
                         if (insn instanceof MethodInsnNode) {
@@ -170,6 +205,10 @@ public final class Main
                 }
             }
 
+            for (val field : node.fields)
+                if ((field.access & ACC_SYNTHETIC) != 0)
+                    field.access &= ~ACC_SYNTHETIC;
+
             node.methods.removeIf(methodNode -> methodNode.desc.equals("(IILjava/lang/String;II)Ljava/lang/String;"));
         }
 
@@ -189,13 +228,6 @@ public final class Main
         jos.close();
     }
 
-    public static void main(String[] args)
-            throws IOException {
-        try (val main = new Main()) {
-            main.start(args);
-        }
-    }
-
     private String decrypt(int n, int n2, String str, int n3, int n4) {
         val builder = new StringBuilder();
         var n5 = 0;
@@ -211,24 +243,47 @@ public final class Main
         return builder.toString();
     }
 
+    private char[] decrypt(String str, char[] chars) {
+        val charArray = str.toCharArray();
+        val i = charArray.length;
+        for (var n = 0; i > n; ++n) {
+            val c = charArray[n];
+            var c2 = Character.MIN_VALUE;
+            switch (n % 7) {
+                case 0:
+                    c2 = chars[0];
+                    break;
+                case 1:
+                    c2 = chars[1];
+                    break;
+                case 2:
+                    c2 = chars[2];
+                    break;
+                case 3:
+                    c2 = chars[3];
+                    break;
+                case 4:
+                    c2 = chars[4];
+                    break;
+                case 5:
+                    c2 = chars[5];
+                    break;
+                default:
+                    c2 = chars[6];
+                    break;
+            }
+            charArray[n] = (char) (c ^ c2);
+        }
+        return new String(charArray).intern().toCharArray();
+    }
+
     private int xor(int n, int n2) {
         return ((n | n2) << 1) + ~(n ^ n2) + 1;
     }
 
-    private Field getField(Class<?> clazz, String name, Class<?> type) {
-        Field field = null;
-
-        for (val f : clazz.getDeclaredFields()) {
-            if (f.getName().equals(name) && f.getType() == type) {
-                field = f;
-                break;
-            }
-        }
-
-        if (field != null)
-            field.setAccessible(true);
-
-        return field;
+    public static void main(String[] args)
+            throws IOException {
+        new Main().start(args);
     }
 
 }
